@@ -1,0 +1,178 @@
+name: deploy frontend
+
+# 실행 이름: PR이벤트면 PR번호/제목 + SHA, 수동이면 브랜치+입력SHA
+run-name: |
+  ${{ github.event_name == 'pull_request' &&
+      format('Deploy PR #{0} "{1}" / {2}',
+        github.event.pull_request.number,
+        github.event.pull_request.title,
+        github.event.pull_request.head.sha
+      )
+      || format('Deploy BR {0} / {1}',
+        github.ref_name,
+        github.event.inputs.commit || 'latest HEAD'
+      )
+  }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: "8자리 short SHA (비워두면 브랜치의 최신 커밋)"
+        required: false
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    # ✅ 공통 checkout: 이벤트별로 SHA 결정
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.ref }}
+
+    # ✅ SHA 계산 (PR이면 head.sha, 수동이면 입력값 or HEAD)
+    - name: Resolve commit SHA
+      id: resolve_sha
+      run: |
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          FULL_SHA="${{ github.event.pull_request.head.sha }}"
+        else
+          if [ -n "${{ github.event.inputs.commit }}" ]; then
+            FULL_SHA=$(git rev-parse ${{ github.event.inputs.commit }})
+          else
+            FULL_SHA=$(git rev-parse HEAD)
+          fi
+        fi
+        SHORT_SHA=$(echo $FULL_SHA | cut -c1-8)
+        echo "Using commit: $FULL_SHA ($SHORT_SHA)"
+        echo "full_sha=$FULL_SHA" >> $GITHUB_OUTPUT
+        echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+        cache: 'npm'
+
+    # ✅ 커밋 SHA 치환
+    - name: Replace commit SHA in Home.tsx
+      run: |
+        SHORT_SHA="${{ steps.resolve_sha.outputs.short_sha }}"
+        sed -i "s/COMMIT_SHA/$SHORT_SHA/g" src/components/pages/Home.tsx
+
+    - name: Install dependencies
+      run: npm ci
+
+    - name: Build application
+      run: npm run build
+
+    # ✅ 배포용 tar.gz 생성
+    - name: Create deployment archive
+      run: |
+        if [ -d build ]; then
+          tar -czf deploy.tar.gz -C build .
+        else
+          echo "❌ No build output found!" && exit 1
+        fi
+
+    - name: Setup SSH
+      uses: webfactory/ssh-agent@v0.8.0
+      with:
+        ssh-private-key: ${{ secrets.SSH_GROOT_KEY }}
+
+    - name: Add server to known hosts
+      run: |
+        mkdir -p ~/.ssh
+        ssh-keyscan -H deploy.logonme.click >> ~/.ssh/known_hosts || true
+
+    - name: Deploy to server
+      run: |
+        scp deploy.tar.gz ec2-user@deploy.logonme.click:/home/ec2-user/
+        ssh ec2-user@deploy.logonme.click "cd /home/ec2-user && ./deploy.sh"
+
+    # ✅ 배포 후 슬롯 확인
+    - name: Get active slot
+      id: active_slot
+      run: |
+        SLOT=$(ssh ec2-user@deploy.logonme.click "(cat /home/ec2-user/DEPLOY_SLOT || echo 'green')")
+        echo "slot=$SLOT" >> $GITHUB_OUTPUT
+
+    # ✅ 배포된 URL 정상 응답 확인 (5분 동안 10초 간격 재시도)
+    - name: Verify deployed URL
+      run: |
+        SLOT="${{ steps.active_slot.outputs.slot }}"
+        URL="https://${SLOT}.logonme.click"
+
+        echo "🔍 배포 검증 시작: ${URL}"
+        ATTEMPTS=30   # 30회 * 10초 = 5분
+        COUNT=0
+
+        while [ $COUNT -lt $ATTEMPTS ]; do
+          STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" "${URL}" || echo "000")
+          echo "Attempt $((COUNT+1)) → HTTP $STATUS_CODE"
+
+          if [ "$STATUS_CODE" = "200" ]; then
+            echo "✅ 검증 성공! HTTP 200"
+            exit 0
+          fi
+
+          COUNT=$((COUNT+1))
+          echo "⏳ 10초 후 재시도..."
+          sleep 10
+        done
+
+        echo "❌ 검증 실패! 5분 동안 HTTP 200 응답을 받지 못했습니다."
+        exit 1
+
+    # ✅ Summary 출력 (PR이벤트와 수동 둘 다 지원)
+    - name: Write deployment summary
+      run: |
+        SLOT="${{ steps.active_slot.outputs.slot }}"
+        SHORT_SHA="${{ steps.resolve_sha.outputs.short_sha }}"
+        URL="https://${SLOT}.logonme.click"
+
+        echo "## 🚀 프론트엔드 배포 완료" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          echo "| 항목 | 값 |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-----|" >> $GITHUB_STEP_SUMMARY
+          echo "| PR 번호 | #${{ github.event.pull_request.number }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 제목 | ${{ github.event.pull_request.title }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 브랜치 | ${{ github.head_ref }} |" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "| 항목 | 값 |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-----|" >> $GITHUB_STEP_SUMMARY
+          echo "| 브랜치 | ${{ github.ref_name }} |" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        echo "| 커밋 SHA | \`${SHORT_SHA}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| 배포 슬롯 | \`${SLOT}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| 접속 URL | [${URL}](${URL}) |" >> $GITHUB_STEP_SUMMARY
+
+    # ✅ PR 이벤트면 코멘트 작성
+    - name: Comment on PR with deployed commit
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const slot = "${{ steps.active_slot.outputs.slot }}".trim();
+          const shortSha = "${{ steps.resolve_sha.outputs.short_sha }}";
+          const url = `https://${slot}.logonme.click`;
+          const pr_number = Number("${{ github.event.pull_request.number }}");
+
+          github.rest.issues.createComment({
+            issue_number: pr_number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: `🚀 PR **#${pr_number} (${context.payload.pull_request.head.ref})**\n커밋 \`${shortSha}\` 이(가) **${slot}** 슬롯에 배포되었습니다!\n👉 [${url}](${url})`
+          });
