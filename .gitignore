@@ -102,7 +102,7 @@ temp/
 # Deployment files
 deploy.tar.gz
 deploy-logs/
-deploy.sh
+
 
 # Local development
 .env.local
