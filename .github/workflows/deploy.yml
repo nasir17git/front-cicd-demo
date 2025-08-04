@@ -1,6 +1,7 @@
 name: Daily Tourism Data Sync
 
 on:
+  push:
   schedule:
     # 매일 새벽 2시 (UTC 기준, 한국시간 11시)
     - cron: '0 2 * * *'
